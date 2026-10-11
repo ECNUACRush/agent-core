@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/subagents/`（8 文件）、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-09-22 |
-| 关联 feature | F_05_browser-task-integrity |
+| 最近一次修订日期 | 2026-10-11 |
+| 关联 feature | F_05_browser-task-integrity、F_08_react-iteration-limit |
 
 ## 范围 / 边界
 
@@ -107,6 +107,14 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
     支付/登录接管必须有当前页正证据；取消、截止期限和已有明确终态仍保持不变。
 
 ## 接口契约
+
+### ReAct 迭代耗尽结果
+
+BrowserService 从 worker 结果读取 `termination_reason="max_iterations"`，并在解析
+`output` 中的 JSON 后保留这一字段；非 JSON 输出同样进入现有的迭代耗尽处理路径。
+`_is_max_iteration_result` 优先识别该字段，同时兼容旧版本的英文输出与
+`error="max_iterations_reached"`。部分作答的文本或 JSON 不得掩盖预算耗尽。
+ReAct 的 opt-in 收尾策略不改变 DeepAgent 外层任务循环或 TaskCompletionRail 的完成判定。
 
 ```python
 def build_browser_agent_config(...) -> SubAgentConfig
