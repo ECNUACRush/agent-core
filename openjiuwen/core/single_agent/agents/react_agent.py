@@ -3192,12 +3192,9 @@ class ReActAgent(BaseAgent):
                 return answer
             if ctx.consume_model_continue_request() or ctx.has_pending_steering():
                 result["finalization_error"] = "Finalization requires further model work or pending user input"
-            elif (
-                not isinstance(answer, AssistantMessage)
-                or answer.tool_calls
-                or not answer.content
-                or (isinstance(answer.content, str) and not answer.content.strip())
-            ):
+            elif not isinstance(answer, AssistantMessage) or answer.tool_calls:
+                result["finalization_error"] = "Finalization did not produce a tool-free answer"
+            elif not answer.content or (isinstance(answer.content, str) and not answer.content.strip()):
                 result["finalization_error"] = "Finalization did not produce a tool-free answer"
             else:
                 finish_reason = str(answer.finish_reason or "").strip().lower()
