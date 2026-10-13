@@ -17,6 +17,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
@@ -24,8 +25,9 @@ import pytest
 from openjiuwen.agent_teams.rails.team_context import inject_team_handles
 from openjiuwen.agent_teams.schema.build_context import BuildContext
 from openjiuwen.agent_teams.workflow.backends.team_worker_backend import TeamWorkerBackend
-from openjiuwen.agent_teams.workflow.engine.backends.base import AgentBackend, AgentResult
 from openjiuwen.agent_teams.workflow.engine import run_workflow
+from openjiuwen.agent_teams.workflow.engine.backends.base import AgentBackend, AgentResult
+from openjiuwen.agent_teams.workflow.engine.errors import BackendError
 from openjiuwen.agent_teams.workflow.runner import preprocess_swarmflow
 from openjiuwen.agent_teams.workflow.schema import build_workflow_run_from_events
 
@@ -143,10 +145,11 @@ def test_missing_submit_makes_agent_return_none(tmp_path):
 
 
 def test_per_call_model_hint_routes_through_resolver(tmp_path):
-    """agent(model=X): known name -> resolved config; unknown / no hint -> None.
+    """agent(model=X): known name -> resolved config; no hint -> None.
 
-    The resolver returns a worker ``TeamModelConfig`` (not a built model); a miss
-    or absent hint yields ``None`` so the worker inherits its base spec's model.
+    The resolver returns a worker ``TeamModelConfig`` (not a built model); a
+    missing hint yields ``None`` so the worker inherits its base spec's model.
+    An unresolvable hint is now a pool miss: non-retryable, ``agent()`` -> None.
     """
     script = '''
 from swarmflow import agent
@@ -172,10 +175,10 @@ async def run(args):
     )
     result = asyncio.run(run_workflow(_write(tmp_path, script), backend=backend))
 
-    # "fast" resolves to its config; "unknown" and no-hint miss -> None (the
-    # worker then inherits its base spec's model, not exercised by this stub).
-    assert result == ["ran::fast-cfg", "ran::None", "ran::None"]
-    assert seen == ["fast-cfg", None, None]
+    # "fast" resolves to its config; "unknown" is a pool miss -> non-retryable
+    # error -> agent()=None; no-hint -> None (inherits the base spec's model).
+    assert result == ["ran::fast-cfg", None, "ran::None"]
+    assert seen == ["fast-cfg", None]
 
 
 def test_agent_isolation_option_is_forwarded_to_backend(tmp_path):
@@ -212,6 +215,7 @@ async def run(args):
     return await agent("task", label="w", options={"isolation": "container"})
 '''
     import pytest
+
     from openjiuwen.agent_teams.workflow.engine.errors import EngineError
 
     with pytest.raises(EngineError, match="only supports 'worktree'"):
@@ -221,6 +225,7 @@ async def run(args):
 def test_worktree_isolation_requires_host_worktree_manager():
     """Worktree isolation must use the host-provided manager, not a fallback."""
     import pytest
+
     from openjiuwen.agent_teams.workflow.engine.errors import BackendError
 
     backend = TeamWorkerBackend(model=None)
@@ -669,46 +674,42 @@ def test_reconcile_removes_clean_orphan_and_keeps_dirty(tmp_path, monkeypatch):
     team_paths.reset_openjiuwen_home()
 
 
-def test_activity_rail_emits_tool_name():
-    """SwarmflowActivityRail forwards a throttled tool name on before_tool_call."""
+def test_activity_rail_emits_paired_tool_call_and_result():
+    """before/after_tool_call pair on one tool_call_id; a raised call previews the
+    exception text; non-tool inputs and blank names are ignored on both hooks."""
     from openjiuwen.agent_teams.workflow.backends.team_worker_backend import SwarmflowActivityRail
     from openjiuwen.core.single_agent.rail.base import ToolCallInputs
 
-    emitted: list[str] = []
-    rail = SwarmflowActivityRail(emit=emitted.append)
+    emitted: list[tuple] = []
+    rail = SwarmflowActivityRail(emit=lambda *a: emitted.append(a))
 
-    class _Ctx:
-        inputs = ToolCallInputs(tool_name="write_file")
+    def _ctx(tool_name="write_file", tool_args=None, exception=None):
+        return SimpleNamespace(
+            inputs=ToolCallInputs(tool_call=SimpleNamespace(id="call-7"), tool_name=tool_name,
+                                  tool_args=tool_args or {"path": "a.txt", "content": "hi"}),
+            exception=exception,
+        )
 
-    asyncio.run(rail.before_tool_call(_Ctx()))
-    assert emitted == ["write_file"]
+    asyncio.run(rail.before_tool_call(_ctx()))
+    ctx = _ctx()
+    ctx.inputs.tool_result = "wrote a.txt"
+    asyncio.run(rail.after_tool_call(ctx))
+    asyncio.run(rail.after_tool_call(_ctx("bash", {"command": "ls"}, RuntimeError("tool boom"))))
+    assert emitted == [
+        ("tool_call", "call-7", "write_file", '{"path": "a.txt", "content": "hi"}'),
+        ("tool_result", "call-7", "write_file", "wrote a.txt"),
+        ("tool_result", "call-7", "bash", "tool boom"),
+    ]
 
-    # Non-tool inputs / blank tool names are ignored.
-    class _NoInput:
-        inputs = None
-
-    asyncio.run(rail.before_tool_call(_NoInput()))
-    assert emitted == ["write_file"]
-
-
-def test_activity_rail_throttles_bursts():
-    """Multiple tool calls within the min interval emit at most once."""
-    from openjiuwen.agent_teams.workflow.backends.team_worker_backend import SwarmflowActivityRail
-    from openjiuwen.core.single_agent.rail.base import ToolCallInputs
-
-    emitted: list[str] = []
-    rail = SwarmflowActivityRail(emit=emitted.append, min_interval_s=60.0)
-
-    class _Ctx:
-        inputs = ToolCallInputs(tool_name="bash")
-
-    asyncio.run(rail.before_tool_call(_Ctx()))
-    asyncio.run(rail.before_tool_call(_Ctx()))
-    assert emitted == ["bash"]
+    asyncio.run(rail.before_tool_call(SimpleNamespace(inputs=None)))
+    blank = _ctx(tool_name="")
+    asyncio.run(rail.before_tool_call(blank))
+    asyncio.run(rail.after_tool_call(blank))
+    assert len(emitted) == 3
 
 
 def test_activity_emitter_builds_agent_activity_event():
-    """The backend emitter forwards tool calls as agent_activity progress events."""
+    """The backend emitter forwards structured tool activity as agent_activity events."""
     from openjiuwen.agent_teams.workflow.backends.team_worker_backend import TeamWorkerBackend
     from openjiuwen.agent_teams.workflow.engine.progress import ProgressKind
 
@@ -716,7 +717,7 @@ def test_activity_emitter_builds_agent_activity_event():
     backend = TeamWorkerBackend(model=None)
     backend.bind_progress_sink(events.append)
     emit = backend._make_activity_emitter("main/call:7", "review", "coder")
-    emit("write_file")
+    emit("tool_result", "call-9", "write_file", "wrote a.txt")
 
     assert len(events) == 1
     ev = events[0]
@@ -724,11 +725,323 @@ def test_activity_emitter_builds_agent_activity_event():
     assert ev.agent_id == "main/call:7"
     assert ev.phase == "review"
     assert ev.label == "coder"
-    assert ev.message == "tool: write_file"
+    assert ev.activity_type == "tool_result"
+    assert ev.tool_call_id == "call-9"
+    assert ev.tool_name == "write_file"
+    assert ev.content == "wrote a.txt"
+    assert ev.message == "tool: write_file"  # legacy narration kept
 
     # No sink bound -> emitter is a silent no-op.
     events.clear()
     backend.bind_progress_sink(None)
     emit = backend._make_activity_emitter("main/call:8", "review", "coder")
-    emit("bash")
+    emit("tool_call", "c-1", "bash", "ls")
     assert events == []
+
+
+def test_activity_emitter_truncates_content_at_the_guard_bound():
+    """Content passes through in full; only the pathological-payload guard cuts (with a marker)."""
+    from openjiuwen.agent_teams.workflow.backends.team_worker_backend import TeamWorkerBackend
+
+    events: list = []
+    backend = TeamWorkerBackend(model=None)
+    backend.bind_progress_sink(events.append)
+    emit = backend._make_activity_emitter("main/call:7", "review", "coder")
+
+    from openjiuwen.agent_teams.workflow.backends.activity_emitter import (
+        ACTIVITY_CONTENT_LIMIT,
+        truncate_activity_content,
+    )
+
+    # A realistic argument body passes through in full.
+    realistic = "write_file with a full argument body " + "y" * 2048
+    emit("tool_call", "call-9", "write_file", realistic)
+    assert events[0].content == realistic
+
+    # Only a payload beyond the pathological guard is cut, marker included.
+    emit("tool_call", "call-10", "bash", "x" * (ACTIVITY_CONTENT_LIMIT + 10))
+    assert events[1].content == "x" * ACTIVITY_CONTENT_LIMIT + "…(truncated)"
+    assert truncate_activity_content(None) is None
+
+
+# ---------------------------------------------------------------------------
+# agent_type routing (third-party workers)
+# ---------------------------------------------------------------------------
+
+
+def _pool(*names: str) -> SimpleNamespace:
+    """Mirror test_external_model.py's fake team backend: get_model_pool only."""
+    return SimpleNamespace(
+        get_model_pool=lambda: [
+            SimpleNamespace(
+                model_name=name,
+                api_key="k1",
+                api_base_url="https://api.jiuwen.example/v1",
+                api_provider="deepseek",
+            )
+            for name in names
+        ],
+    )
+
+
+def _external_backend(declared: tuple[str, ...] = ("codex",), *, team_backend: Any = None) -> "_FakeExternalBackend":
+    from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec
+
+    return _FakeExternalBackend(
+        model=None,
+        team_name="t",
+        run_id="r1",
+        external_cli_agents=tuple(ExternalCliAgentSpec(cli_agent=name) for name in declared),
+        team_backend=team_backend,
+    )
+
+
+class _FakeExternalBackend(TeamWorkerBackend):
+    """Records the external route instead of launching a CLI."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.external_calls: list[dict] = []
+        self.native_calls: int = 0
+
+    async def _execute_worker(self, prompt, tools, *, member_name, has_schema, model, budget_rail=None, **_kw):
+        self.native_calls += 1
+        return "native"
+
+    async def _execute_external_worker(self, prompt, *, member_name, entry, agent_type, opts, schema_json, budget_rail, model_config=None):
+        from openjiuwen.agent_teams.workflow.backends.external_turns import ExternalTurnOutcome
+
+        self.external_calls.append(
+            {"member": member_name, "agent_type": agent_type, "schema": schema_json, "model_config": model_config}
+        )
+        budget_rail.bill(42)
+        return ExternalTurnOutcome(text="ext", structured={"ok": True} if schema_json else None, tokens=42)
+
+
+def test_agent_type_routes_to_external_worker_and_bills_tokens():
+    backend = _external_backend()
+    result = asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, {"type": "object"}, call_key="k"))
+    assert result.structured == {"ok": True}
+    assert result.text == "ext"
+    assert result.tokens == 42
+    assert backend.native_calls == 0
+    assert backend.external_calls[0]["agent_type"] == "codex"
+    assert backend.external_calls[0]["member"].startswith("r1-x-")
+
+
+def test_agent_type_unknown_backend_names_both_lists():
+    backend = _external_backend(declared=("codex",))
+    with pytest.raises(BackendError) as exc:
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "gemini2"}, None, call_key="k"))
+    message = str(exc.value)
+    assert "gemini2" in message
+    assert "claude" in message and "codex" in message  # registry list
+    assert "declared" in message
+    assert "SDK backends:" in message
+    assert "external_cli_agents:" in message
+    assert backend.external_calls == []
+
+
+def test_agent_type_not_declared_by_team_is_rejected():
+    backend = _external_backend(declared=("claude",))
+    with pytest.raises(BackendError, match="codex"):
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, None, call_key="k"))
+
+
+def test_describe_model_uses_the_plan():
+    from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec, ExternalCliBuiltinModel
+
+    builtin = ExternalCliBuiltinModel(name="gpt-5-codex", efforts=["medium"], default_effort="medium")
+    declared = ExternalCliAgentSpec(cli_agent="codex", builtin_models=[builtin])
+    backend = _FakeExternalBackend(
+        model=None, team_name="t", external_cli_agents=(declared,), team_backend=_pool("deepseek-v4-flash")
+    )
+    # Native opts / bare third-party opts: no display.
+    assert backend.describe_model({"label": "x"}) is None
+    assert backend.describe_model({"label": "x", "agent_type": "codex"}) is None
+    # Builtin pick -> the catalog name (endpointless).
+    assert backend.describe_model({"label": "x", "agent_type": "codex", "builtin_model": "gpt-5-codex"}) == "gpt-5-codex"
+    # Pool hit -> the pool name.
+    assert backend.describe_model({"label": "x", "agent_type": "codex", "model": "deepseek-v4-flash"}) == "deepseek-v4-flash"
+    # An invalid combo never raises pre-launch: best-known hint wins (model first).
+    assert backend.describe_model({"agent_type": "codex", "model": "X"}) == "X"
+    assert backend.describe_model({"agent_type": "codex", "model": "X", "builtin_model": "gpt-5-codex"}) == "X"
+
+
+def test_external_builtin_model_reaches_worker_as_endpointless_config():
+    from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec, ExternalCliBuiltinModel
+
+    builtin = ExternalCliBuiltinModel(name="gpt-5-codex", efforts=["medium"], default_effort="medium")
+    entry = ExternalCliAgentSpec(cli_agent="codex", builtin_models=[builtin])
+    backend = _FakeExternalBackend(model=None, team_name="t", run_id="r1", external_cli_agents=(entry,))
+    result = asyncio.run(
+        backend.run("p", {"label": "x", "agent_type": "codex", "builtin_model": "gpt-5-codex"}, None, call_key="k")
+    )
+    assert result.text == "ext" and backend.native_calls == 0
+    cfg = backend.external_calls[0]["model_config"]
+    assert cfg is not None
+    assert cfg.model == "gpt-5-codex" and cfg.effort == "medium"
+    assert cfg.provider is None and cfg.api_base is None and cfg.api_key is None
+
+
+def test_external_pool_miss_raises_before_builder_or_worktree(monkeypatch):
+    """A pool-miss model hint fails before any resource is touched."""
+    backend = _external_backend(team_backend=_pool("deepseek-v4-flash"))
+    ensure_calls: list[str] = []
+
+    async def fake_ensure(name: str, opts: dict) -> None:
+        ensure_calls.append(name)
+
+    monkeypatch.setattr(backend._worktrees, "ensure", fake_ensure)
+    with pytest.raises(BackendError) as exc:
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex", "model": "X"}, None, call_key="k"))
+    assert exc.value.retryable is False
+    assert "deepseek-v4-flash" in str(exc.value)
+    assert backend.external_calls == []
+    assert ensure_calls == []
+
+
+# ---------------------------------------------------------------------------
+# C1 — external branch must go through worktree ensure / finalize
+# ---------------------------------------------------------------------------
+
+
+def test_external_worktree_finalize_called_even_on_error(monkeypatch):
+    """finalize must run even when _execute_external_worker raises."""
+    backend = _external_backend()
+    finalize_calls: list[str] = []
+
+    async def fake_ensure(name: str, opts: dict) -> None:
+        pass
+
+    async def fake_finalize(name: str) -> None:
+        finalize_calls.append(name)
+
+    async def failing_execute(prompt: str, **kwargs: Any) -> None:
+        raise BackendError("external boom")
+
+    monkeypatch.setattr(backend._worktrees, "ensure", fake_ensure)
+    monkeypatch.setattr(backend._worktrees, "finalize", fake_finalize)
+    monkeypatch.setattr(backend, "_execute_external_worker", failing_execute)
+
+    with pytest.raises(BackendError, match="external boom"):
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, None, call_key="k"))
+
+    assert len(finalize_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# External turn outcomes: billing, reported model, runtime build failures
+# ---------------------------------------------------------------------------
+
+
+def _external_backend_with_turns(monkeypatch, *, run_turn, reported_model=None, started_with=None, runtime=None):
+    """A codex-declared backend whose ExternalMemberTurns is a fake driving ``run_turn``."""
+    import openjiuwen.agent_teams.workflow.backends.team_worker_backend as be_mod
+    from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec
+
+    class _Turns:
+        def __init__(self, runtime: Any, *, member_name: str, auth_hint_models: Any = None) -> None:
+            pass
+
+        @property
+        def reported_model(self):
+            return reported_model
+
+        async def start(self, team_session: Any) -> None:
+            if started_with is not None:
+                started_with.append(team_session)
+
+        async def run_turn(self, prompt: str, *, schema_json: Any = None) -> Any:
+            return await run_turn()
+
+        async def stop(self) -> None:
+            pass
+
+    async def _fake_build(**kwargs: Any) -> object:
+        return runtime if runtime is not None else object()
+
+    monkeypatch.setattr(be_mod, "ExternalMemberTurns", _Turns)
+    monkeypatch.setattr("openjiuwen.agent_teams.external.cli_agent.spawn.build_cli_workflow_runtime", _fake_build)
+    return TeamWorkerBackend(
+        model=None, team_name="t", run_id="r1", external_cli_agents=(ExternalCliAgentSpec(cli_agent="codex"),),
+    )
+
+
+def test_external_turn_bills_tokens_and_attaches_reported_model(monkeypatch):
+    """Success and failure both bill the turn and name the CLI-reported model.
+
+    A failed turn bills its tokens before re-raising and the BackendError
+    carries the model; a successful one carries it on the AgentResult. The
+    turn driver always starts with a real team session, never None.
+    """
+    from openjiuwen.agent_teams.workflow.backends.external_turns import ExternalTurnOutcome
+
+    started_with: list[Any] = []
+
+    async def _fail():
+        raise BackendError("boom", tokens=9)
+
+    backend = _external_backend_with_turns(monkeypatch, run_turn=_fail, reported_model="gpt-5.5",
+                                           started_with=started_with)
+    with pytest.raises(BackendError, match="boom") as exc:
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, None, call_key="k"))
+    assert backend.budget.spent == 9
+    assert exc.value.model == "gpt-5.5"
+    assert started_with and started_with[0] is not None
+
+    async def _ok():
+        return ExternalTurnOutcome(text="ext", structured=None, tokens=42)
+
+    backend = _external_backend_with_turns(monkeypatch, run_turn=_ok, reported_model="gpt-5.5")
+    result = asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, None, call_key="k"))
+    assert result.text == "ext"
+    assert result.model == "gpt-5.5"
+    assert backend.budget.spent == 42
+
+
+def test_build_cli_failure_raises_backend_error(monkeypatch):
+    """A runtime build failure wraps as BackendError(…build failed…)."""
+    from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec
+
+    async def _exploding_build(**kwargs: Any) -> None:
+        raise RuntimeError("no cli")
+
+    monkeypatch.setattr(
+        "openjiuwen.agent_teams.external.cli_agent.spawn.build_cli_workflow_runtime",
+        _exploding_build,
+    )
+
+    backend = TeamWorkerBackend(
+        model=None,
+        team_name="t",
+        run_id="r1",
+        external_cli_agents=(ExternalCliAgentSpec(cli_agent="codex"),),
+    )
+
+    with pytest.raises(BackendError, match="build failed"):
+        asyncio.run(backend.run("p", {"label": "x", "agent_type": "codex"}, None, call_key="k"))
+
+
+def test_external_worker_binds_activity_sink_with_node_identity(monkeypatch):
+    """A one-shot third-party worker with agent_id in opts binds the runtime's
+    activity sink carrying (agent_id, phase, label) and no correlation id."""
+    from openjiuwen.agent_teams.workflow.backends.external_turns import ExternalTurnOutcome
+
+    binds: list[tuple] = []
+
+    class _RecRuntime:
+        def bind_activity_sink(self, sink, *, agent_id=None, phase=None, label=None, correlation_id=None):
+            binds.append((sink, agent_id, phase, label, correlation_id))
+
+    async def _ok():
+        return ExternalTurnOutcome(text="ext", structured=None, tokens=0)
+
+    backend = _external_backend_with_turns(monkeypatch, run_turn=_ok, runtime=_RecRuntime())
+    sink = object()
+    backend.bind_progress_sink(sink)
+    result = asyncio.run(
+        backend.run("p", {"label": "x", "agent_type": "codex", "agent_id": "n1", "phase": "run"}, None, call_key="k")
+    )
+    assert result.text == "ext"
+    assert binds == [(sink, "n1", "run", "x", None)]

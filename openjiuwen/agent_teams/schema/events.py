@@ -462,6 +462,10 @@ class WorkflowProgressTeamEvent(BaseEventMessage):
     label: Optional[str] = Field(default=None, description="Agent call label, on agent_* kinds")
     prompt: Optional[str] = Field(default=None, description="Rendered agent prompt, on agent_started")
     model: Optional[str] = Field(default=None, description="Model hint for the agent call, on agent_started")
+    agent_type: Optional[str] = Field(
+        default=None,
+        description="External provider kind (claude / codex) on agent_started; None for native workers",
+    )
     outcome: Optional[str] = Field(default=None, description="Short result preview, on agent_completed")
     text: Optional[str] = Field(default=None, description="Free narration text, on all kinds")
     phases: Optional[list[PhasePlan]] = Field(
@@ -594,6 +598,27 @@ class WorkflowProgressTeamEvent(BaseEventMessage):
         description=(
             "Completion output tokens on agent_completed (AgentResult.output_tokens); "
             "display split of tokens, None when the provider reported no split."
+        ),
+    )
+    activity_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "AGENT_ACTIVITY only: 'tool_call' / 'tool_result' — which half of the "
+            "activity pair this event carries."
+        ),
+    )
+    tool_call_id: Optional[str] = Field(
+        default=None,
+        description="AGENT_ACTIVITY only: pairs a tool_call with its tool_result.",
+    )
+    tool_name: Optional[str] = Field(
+        default=None,
+        description="AGENT_ACTIVITY only: the invoked tool's name.",
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description=(
+            "AGENT_ACTIVITY only: 512-char args/result preview (engine-truncated)."
         ),
     )
 

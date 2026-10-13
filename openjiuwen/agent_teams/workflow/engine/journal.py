@@ -81,6 +81,12 @@ def call_signature(
     identity = {k: opts.get(k) for k in ("label", "phase", "model")}
     if opts.get("isolation"):
         identity["isolation"] = opts["isolation"]
+    if opts.get("agent_type"):
+        identity["agent_type"] = opts["agent_type"]
+    if opts.get("builtin_model"):
+        identity["builtin_model"] = opts["builtin_model"]
+    if opts.get("effort"):
+        identity["effort"] = opts["effort"]
     parts = [
         prompt,
         json.dumps(identity, sort_keys=True, ensure_ascii=False),
